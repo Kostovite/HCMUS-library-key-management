@@ -27,6 +27,7 @@ class LibraryKeyManagement:
         self.conn = sqlite3.connect(db_name, detect_types=sqlite3.PARSE_DECLTYPES)
         self.cursor = self.conn.cursor()
 
+        # To do: Create a local storage for available and borrowed keys later, then syncing, still keep data in ram for better performance.
         self.available_keys = set(range(FIRST_KEY_ID, LAST_KEY_ID))
         self.borrowed_keys = set()
 
