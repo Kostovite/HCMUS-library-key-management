@@ -3,9 +3,10 @@ import sqlite3
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
+import threading
 
 FIRST_KEY_ID = 1
-LAST_KEY_ID = 300
+LAST_KEY_ID = 100
 
 DATABASE_NAME = 'library_key_management.db'
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -24,17 +25,18 @@ sqlite3.register_converter("timestamp", convert_datetime)
 class LibraryKeyManagement:
     def __init__(self, db_name=DATABASE_NAME):
         self.current_student = None
-        self.conn = sqlite3.connect(db_name, detect_types=sqlite3.PARSE_DECLTYPES)
+        self.conn = sqlite3.connect(db_name, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
         self.cursor = self.conn.cursor()
 
-        # To do: Create a local storage for available and borrowed keys later, then syncing, still keep data in ram for better performance.
-        self.available_keys = set(range(FIRST_KEY_ID, LAST_KEY_ID))
+        # We no longer initialize keys in memory; they will be loaded from the database
+        self.available_keys = set()
         self.borrowed_keys = set()
 
         self._create_tables()
+        self._load_keys_from_db()
 
     def _create_tables(self):
-        # Create the student_entries table with key_id and key_status allowing NULL
+        # Create the tables if they don't exist
         self.cursor.execute('''
         CREATE TABLE IF NOT EXISTS student_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,22 +47,50 @@ class LibraryKeyManagement:
         )
         ''')
 
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS key_status (
+            key_id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL CHECK (status IN ('Available', 'Borrowed'))
+        )
+        ''')
+
+        # Initialize the key_status table with keys in the range if empty
+        self.cursor.execute('SELECT COUNT(*) FROM key_status')
+        count = self.cursor.fetchone()[0]
+        if count == 0:
+            self.cursor.executemany('''
+            INSERT INTO key_status (key_id, status)
+            VALUES (?, 'Available')
+            ''', [(key_id,) for key_id in range(FIRST_KEY_ID, LAST_KEY_ID + 1)])
+
         self.conn.commit()
 
-    def process_input(self, input_id):
-        if self._is_student_id(input_id):
-            return self._process_student_id(input_id)
-        elif self._is_key_id(input_id):
-            return self._process_key_id(input_id)
-        else:
-            return "Invalid input. Please enter a valid student ID or key ID."
+    def _load_keys_from_db(self):
+        """Load available and borrowed keys from the key_status table into RAM."""
+        self.cursor.execute('SELECT key_id, status FROM key_status')
+        keys = self.cursor.fetchall()
 
-    def _is_student_id(self, id_str):
-        return bool(re.match(r'^[A-Za-z0-9]{8}$', id_str))
+        for key_id, status in keys:
+            if status == 'Borrowed':
+                self.borrowed_keys.add(key_id)
+            elif status == 'Available':
+                self.available_keys.add(key_id)
 
-    def _is_key_id(self, id_str):
-        return id_str.isdigit() and FIRST_KEY_ID <= int(id_str) <= LAST_KEY_ID
+    def _update_key_status_in_db(self, key_id, status):
+        """Perform the key update in the database asynchronously."""
+        def update():
+            with sqlite3.connect(DATABASE_NAME, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                INSERT INTO key_status (key_id, status) 
+                VALUES (?, ?)
+                ON CONFLICT(key_id) DO UPDATE SET status = excluded.status
+                ''', (key_id, status))
+                conn.commit()
 
+        # Run the database update in a separate thread
+        threading.Thread(target=update, daemon=True).start()
+    
     def _process_student_id(self, student_id):
         self.current_student = student_id
         self.cursor.execute('''
@@ -71,6 +101,7 @@ class LibraryKeyManagement:
         return f"Student {student_id} entered the library."
 
     def _process_key_id(self, key_id):
+        """Process the scanned key."""
         if not self.current_student:
             return "Error: No student ID scanned. Please scan a student ID first."
 
@@ -85,22 +116,27 @@ class LibraryKeyManagement:
             ''', (key_id, key_id))
             self.conn.commit()
 
+            # Update in memory
             self.borrowed_keys.remove(key_id)
             self.available_keys.add(key_id)
+
+            # Async update in the database
+            self._update_key_status_in_db(key_id, 'Available')
+
             return f"Key {key_id} returned."
         
-        if key_id in self.available_keys or key_id not in self.borrowed_keys:
+        if key_id in self.available_keys:
             # Check if the student already has a borrowed key
             self.cursor.execute('''
             SELECT key_id FROM student_entries
-            WHERE student_id = ? AND (key_status = 'Borrowed' OR key_status = 'Returned')
+            WHERE student_id = ? AND key_status = 'Borrowed'
             ''', (self.current_student,))
             active_borrowed_key = self.cursor.fetchone()
 
             if active_borrowed_key and active_borrowed_key[0] != key_id:
                 return f"Error: Student {self.current_student} already has key {active_borrowed_key[0]} borrowed. Return it before borrowing another key."
 
-            # Borrow the key, including cases where it was previously returned
+            # Borrow the key
             self.cursor.execute('''
             UPDATE student_entries
             SET key_id = ?, key_status = 'Borrowed'
@@ -108,8 +144,13 @@ class LibraryKeyManagement:
             ''', (key_id, self.current_student))
             self.conn.commit()
 
+            # Update in memory
             self.available_keys.remove(key_id)
             self.borrowed_keys.add(key_id)
+
+            # Async update in the database
+            self._update_key_status_in_db(key_id, 'Borrowed')
+
             return f"Key {key_id} borrowed by student {self.current_student}."
 
     def get_status(self):
@@ -124,9 +165,9 @@ class LibraryKeyManagement:
         # Create a dictionary to keep track of borrowed keys with student IDs
         borrowed_dict = {key[1]: key[0] for key in borrowed_keys}  # key_id -> student_id
 
-        # Create a list of available keys with their status
+        # Create a list of all keys with their status (whether borrowed or available)
         status_list = []
-        for key_id in self.available_keys:
+        for key_id in range(FIRST_KEY_ID, LAST_KEY_ID + 1):
             if key_id in borrowed_dict:
                 status_list.append((key_id, 'Borrowed', borrowed_dict[key_id]))  # Key is borrowed
             else:
